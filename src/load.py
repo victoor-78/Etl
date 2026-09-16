@@ -5,6 +5,7 @@
 import os
 from urllib.parse import quote_plus
 
+import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
@@ -99,6 +100,69 @@ def load_dim_restaurante(engine, df):
     return len(df)
 
 
+def load_fact(engine, df_fact):
+    """Resuelve las claves subrogadas e inserta la tabla de hechos.
+
+    Las dimensiones ya están en PostgreSQL, así que se leen de vuelta para saber
+    qué clave subrogada le asignó el SERIAL a cada id_origen. El cruce se hace
+    con merges de pandas en lugar de con JOINs en SQL porque los hechos todavía
+    viven en un DataFrame y así se evita una tabla temporal más.
+
+    Las tres dimensiones de entidad se cruzan por id_origen; dim_tiempo no tiene
+    id_origen, así que se cruza por la pareja (fecha, franja_horaria), que es su
+    grano real.
+    """
+    claves = ["id_tiempo", "id_producto", "id_restaurante", "id_cliente"]
+
+    dim_producto = pd.read_sql("SELECT id_producto, id_origen FROM dim_producto", engine)
+    dim_restaurante = pd.read_sql("SELECT id_restaurante, id_origen FROM dim_restaurante", engine)
+    dim_cliente = pd.read_sql("SELECT id_cliente, id_origen FROM dim_cliente", engine)
+    dim_tiempo = pd.read_sql("SELECT id_tiempo, fecha, franja_horaria FROM dim_tiempo", engine)
+
+    # Merges LEFT a propósito: si fueran INNER, las filas que no resuelven
+    # desaparecerían en silencio y la tabla de hechos quedaría incompleta sin
+    # avisar. Con LEFT quedan como nulos y la validación posterior los detecta.
+    df = (
+        df_fact.merge(dim_producto, left_on="dish_id", right_on="id_origen", how="left")
+        .drop(columns="id_origen")
+        .merge(dim_restaurante, left_on="restaurant_id", right_on="id_origen", how="left")
+        .drop(columns="id_origen")
+        .merge(dim_cliente, left_on="user_id", right_on="id_origen", how="left")
+        .drop(columns="id_origen")
+        .merge(dim_tiempo, on=["fecha", "franja_horaria"], how="left")
+    )
+
+    # Verificación: cualquier nulo en una clave foránea significa que un dato de
+    # origen no tiene su fila en la dimensión (por ejemplo, un pedido de un
+    # restaurante desactivado, que extract_restaurantes descarta). Se corta aquí
+    # con un mensaje explícito en lugar de dejar que PostgreSQL lance un error
+    # de NOT NULL mucho más difícil de interpretar.
+    nulos = df[claves].isna().sum()
+    if nulos.any():
+        filas_afectadas = int(df[claves].isna().any(axis=1).sum())
+        detalle = ", ".join(f"{clave}={int(n)}" for clave, n in nulos.items() if n)
+        raise ValueError(
+            f"No se pudieron resolver las claves subrogadas de {filas_afectadas} "
+            f"de {len(df)} filas de hechos. Nulos por clave: {detalle}. "
+            "Revisa que las dimensiones estén cargadas y que los datos de origen "
+            "no apunten a entidades filtradas en la extracción."
+        )
+
+    # Tras los merges las claves son float (pandas las promociona por si hay
+    # nulos); se devuelven a entero para que encajen con las columnas INTEGER.
+    df[claves] = df[claves].astype(int)
+
+    columnas_destino = claves + [
+        "cantidad",
+        "precio_unitario",
+        "importe_linea",
+        "id_pedido_origen",
+    ]
+    return df[columnas_destino].to_sql(
+        "fact_pedido_item", engine, if_exists="append", index=False
+    )
+
+
 def contar_filas(engine):
     """Devuelve el número de filas de cada tabla del DW, para verificar la carga."""
     conteos = {}
@@ -111,6 +175,7 @@ def contar_filas(engine):
 if __name__ == "__main__":
     from src.extract import (
         extract_clientes,
+        extract_lineas_pedido,
         extract_pedidos,
         extract_platos,
         extract_restaurantes,
@@ -121,6 +186,7 @@ if __name__ == "__main__":
         transform_dim_producto,
         transform_dim_restaurante,
         transform_dim_tiempo,
+        transform_fact,
     )
 
     engine_mysql = get_mysql_engine()
@@ -131,12 +197,14 @@ if __name__ == "__main__":
     df_clientes = extract_clientes(engine_mysql)
     df_restaurantes = extract_restaurantes(engine_mysql)
     df_pedidos = extract_pedidos(engine_mysql)
+    df_lineas = extract_lineas_pedido(engine_mysql)
 
-    print("Transformando dimensiones...")
+    print("Transformando dimensiones y hechos...")
     dim_producto = transform_dim_producto(df_platos)
     dim_cliente = transform_dim_cliente(df_clientes)
     dim_restaurante = transform_dim_restaurante(df_restaurantes)
     dim_tiempo = transform_dim_tiempo(df_pedidos)
+    fact = transform_fact(df_lineas, df_pedidos)
 
     print("Vaciando las tablas del Data Warehouse...")
     truncar_tablas(engine_postgres)
@@ -146,6 +214,11 @@ if __name__ == "__main__":
     load_dim_producto(engine_postgres, dim_producto)
     load_dim_restaurante(engine_postgres, dim_restaurante)
     load_dim_cliente(engine_postgres, dim_cliente)
+
+    # Los hechos van al final: necesitan las claves subrogadas que las
+    # dimensiones acaban de generar al insertarse.
+    print("Cargando la tabla de hechos...")
+    load_fact(engine_postgres, fact)
 
     print()
     print("=" * 50)

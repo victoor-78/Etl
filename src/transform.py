@@ -161,9 +161,61 @@ def transform_dim_tiempo(df_pedidos):
     return df.reset_index(drop=True)
 
 
+def transform_fact(df_lineas, df_pedidos):
+    """Prepara las filas de la tabla de hechos, con el grano de línea de pedido.
+
+    Todavía NO resuelve las claves subrogadas: eso ocurre en load.py, porque las
+    dimensiones tienen que estar ya cargadas en PostgreSQL para conocer sus ids.
+    Aquí solo se deja cada línea con los identificadores de origen y los campos
+    necesarios para cruzarla después con cada dimensión.
+
+    La fecha y la franja se calculan igual que en transform_dim_tiempo (misma
+    función _calcular_franja), porque si las dos no coincidieran exactamente el
+    cruce con dim_tiempo dejaría filas sin resolver.
+    """
+    # Se renombra el id del pedido al nombre destino para que el merge no genere
+    # columnas id_x / id_y y para conservar el identificador de origen.
+    pedidos = df_pedidos[["id", "created_at", "user_id", "restaurant_id"]].rename(
+        columns={"id": "id_pedido_origen"}
+    )
+
+    df = df_lineas.merge(
+        pedidos,
+        left_on="order_id",
+        right_on="id_pedido_origen",
+        how="inner",
+    )
+
+    fechas = pd.to_datetime(df["created_at"])
+    df["fecha"] = fechas.dt.date
+    df["franja_horaria"] = _calcular_franja(fechas.dt.hour)
+
+    # Métrica derivada: el importe de la línea no está en el origen.
+    df["importe_linea"] = df["quantity"] * df["unit_price"]
+
+    df = df.rename(columns={"quantity": "cantidad", "unit_price": "precio_unitario"})
+
+    return df[
+        [
+            # Identificadores de origen, para resolver las dimensiones en load.py.
+            "dish_id",
+            "restaurant_id",
+            "user_id",
+            "fecha",
+            "franja_horaria",
+            # Métricas y clave de trazabilidad hacia el sistema operacional.
+            "cantidad",
+            "precio_unitario",
+            "importe_linea",
+            "id_pedido_origen",
+        ]
+    ]
+
+
 if __name__ == "__main__":
     from src.extract import (
         extract_clientes,
+        extract_lineas_pedido,
         extract_pedidos,
         extract_platos,
         extract_restaurantes,
@@ -177,6 +229,9 @@ if __name__ == "__main__":
         "dim_cliente": transform_dim_cliente(extract_clientes(engine)),
         "dim_restaurante": transform_dim_restaurante(extract_restaurantes(engine)),
         "dim_tiempo": transform_dim_tiempo(extract_pedidos(engine)),
+        "hechos (sin claves subrogadas)": transform_fact(
+            extract_lineas_pedido(engine), extract_pedidos(engine)
+        ),
     }
 
     for nombre, df in dimensiones.items():
