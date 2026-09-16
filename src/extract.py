@@ -93,23 +93,3 @@ def extract_lineas_pedido(engine):
           AND o.total_price IS NOT NULL
     """
     return pd.read_sql(consulta, engine)
-
-
-if __name__ == "__main__":
-    engine = get_mysql_engine()
-
-    extracciones = {
-        "Restaurantes activos": extract_restaurantes,
-        "Platos": extract_platos,
-        "Clientes": extract_clientes,
-        "Pedidos entregados": extract_pedidos,
-        "Líneas de pedido": extract_lineas_pedido,
-    }
-
-    for nombre, funcion in extracciones.items():
-        df = funcion(engine)
-        print()
-        print("=" * 70)
-        print(f"{nombre}: {len(df)} filas, {len(df.columns)} columnas")
-        print("=" * 70)
-        print(df.head())

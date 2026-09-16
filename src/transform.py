@@ -210,33 +210,3 @@ def transform_fact(df_lineas, df_pedidos):
             "id_pedido_origen",
         ]
     ]
-
-
-if __name__ == "__main__":
-    from src.extract import (
-        extract_clientes,
-        extract_lineas_pedido,
-        extract_pedidos,
-        extract_platos,
-        extract_restaurantes,
-        get_mysql_engine,
-    )
-
-    engine = get_mysql_engine()
-
-    dimensiones = {
-        "dim_producto": transform_dim_producto(extract_platos(engine)),
-        "dim_cliente": transform_dim_cliente(extract_clientes(engine)),
-        "dim_restaurante": transform_dim_restaurante(extract_restaurantes(engine)),
-        "dim_tiempo": transform_dim_tiempo(extract_pedidos(engine)),
-        "hechos (sin claves subrogadas)": transform_fact(
-            extract_lineas_pedido(engine), extract_pedidos(engine)
-        ),
-    }
-
-    for nombre, df in dimensiones.items():
-        print()
-        print("=" * 70)
-        print(f"{nombre}: {len(df)} filas, {len(df.columns)} columnas")
-        print("=" * 70)
-        print(df.head())
